@@ -6,9 +6,13 @@ import {
 import {
   JOB_MAX, createJob, getJob, listJobs, resumeJob, pauseJob, recoverInterrupted
 } from './import-engine.js'
+import { emit } from './event-bus.js'
+import { attachUser, requirePerm } from './auth.js'
+import * as notify from './notify-engine.js'
 
 const app = express()
 app.use(express.json({ limit: '5mb' })) // 大批量导入（上限 5000 条）
+app.use(attachUser) // 通知模块 RBAC：x-user-id → req.user/req.can（缺省回落值班角色）
 
 const q = (sql, ...p) => db.prepare(sql).all(...p)
 const q1 = (sql, ...p) => db.prepare(sql).get(...p)
@@ -17,6 +21,9 @@ const run = (sql, ...p) => db.prepare(sql).run(...p)
 // 启动恢复：崩溃/重启时未完成的导入任务转「已暂停」，保留进度，等待续跑
 const recovered = recoverInterrupted()
 if (recovered) console.log(`[PUBMON] 恢复 ${recovered} 个中断的批量导入任务（已暂停，可续跑）`)
+// 通知调度器：订阅业务事件 + 启动定时发送/重试/升级；发送中断任务自动回待发送
+const nrec = notify.initNotify()
+if (nrec.recovered) console.log(`[NOTIFY] 恢复 ${nrec.recovered} 个发送中断的通知任务`)
 
 // 危机列表（含来源规则、承接规则、未解除预警数、时间线）
 function crisisList(withTimeline = false) {
@@ -265,13 +272,21 @@ app.post('/api/alert-events/:id/resolve', (req, res) => {
   // 状态守卫：并发/重复提交下仅首次生效
   const r = run("UPDATE alert_events SET status='resolved', resolved=?, resolve_kind='manual' WHERE id=? AND status='open'", ts, ev.id)
   if (!Number(r.changes)) return res.json({ ok: true, already: true, crisisId: ev.crisis_id, openLeft: openLeftOf(ev.crisis_id) })
+  let alTitle = '', alLevel = ''
   if (ev.crisis_id) {
     const c = q1('SELECT * FROM crisis WHERE id=?', ev.crisis_id)
     if (c && c.status !== 'closed') {
       const al = q1('SELECT title FROM alerts WHERE id=?', ev.alert_id)
+      alTitle = al?.title || ''
       addTimeline(c.id, '预警解除', al ? `规则「${al.title}」：${note}` : note, ts)
     }
   }
+  // 通知编排：预警解除（订阅者收解除通报；其他订阅下该事件的待办通知取消）
+  const arow = q1('SELECT title,level FROM alerts WHERE id=?', ev.alert_id)
+  emit('alert_resolved', {
+    alertId: ev.alert_id, alertEventId: ev.id, crisisId: ev.crisis_id,
+    level: arow?.level || '', title: arow?.title || alTitle, detail: note, note, time: ts
+  })
   res.json({ ok: true, crisisId: ev.crisis_id, openLeft: openLeftOf(ev.crisis_id) })
 })
 
@@ -301,6 +316,13 @@ app.post('/api/alerts/:id/resolve', (req, res) => {
     try { db.exec('ROLLBACK') } catch { /* 已回滚 */ }
     return res.status(500).json({ error: String(e.message || e) })
   }
+  // 通知编排：逐条发布解除（按触发记录取消对应待办通知并编排解除通报）
+  for (const ev of events) {
+    emit('alert_resolved', {
+      alertId: al.id, alertEventId: ev.id, crisisId: ev.crisis_id,
+      level: al.level || '', title: al.title, detail: note, note, time: ts
+    })
+  }
   res.json({ ok: true, resolved: events.length })
 })
 
@@ -313,7 +335,13 @@ app.post('/api/crisis', (req, res) => {
   const r = run("INSERT INTO crisis (title,level,status,plan,analysis,created,updated,linked_email,keyword,origin,topic,last_trigger_at) VALUES (?,?,?,?,?,?,?,?,?,'manual',?,NULL)",
     title, level || 'orange', 'monitoring', plan || '', analysis || '', now(), now(), linked_email || '', keyword || '', (topic || '').trim())
   const id = Number(r.lastInsertRowid)
-  run('INSERT INTO crisis_timeline (crisis_id,action,note,time) VALUES (?,?,?,?)', id, '事件建档', '人工建档，初始响应', now())
+  const ts = now()
+  run('INSERT INTO crisis_timeline (crisis_id,action,note,time) VALUES (?,?,?,?)', id, '事件建档', '人工建档，初始响应', ts)
+  // 通知编排：人工建档事件
+  emit('crisis_created', {
+    crisisId: id, level: level || 'orange', topic: (topic || '').trim(),
+    title, detail: `人工建档危机事件（话题「${(topic || '').trim() || '未分类'}」），当前监测中`, time: ts
+  })
   res.json({ ok: true, id })
 })
 app.post('/api/crisis/:id/status', (req, res) => {
@@ -323,8 +351,13 @@ app.post('/api/crisis/:id/status', (req, res) => {
   // 闭环一致性：结案/重开必须走专用链路（级联解除、结案档案、回滚恢复）
   if (status === 'closed') return res.status(400).json({ error: '请使用结案接口（级联解除未解除预警并写入结案档案）' })
   if (c.status === 'closed') return res.status(400).json({ error: '已结案事件请先回滚结案再变更状态' })
+  const ts = now()
   run('UPDATE crisis SET status=? WHERE id=?', status || c.status, c.id)
-  addTimeline(c.id, action || '状态更新', note || '')
+  addTimeline(c.id, action || '状态更新', note || '', ts)
+  emit('crisis_status', {
+    crisisId: c.id, level: c.level, topic: c.topic, title: c.title,
+    detail: note || action || '', extra: { from: c.status, to: status || c.status, note: note || action || '' }, time: ts
+  })
   res.json({ ok: true })
 })
 app.post('/api/crisis/:id/timeline', (req, res) => {
@@ -394,6 +427,18 @@ app.post('/api/crisis/:id/close', (req, res) => {
     try { db.exec('ROLLBACK') } catch { /* 已回滚 */ }
     return res.status(500).json({ error: String(e.message || e) })
   }
+  // 通知编排：联动解除的预警逐条发布解除，再发布结案通报
+  for (const ev of opens) {
+    const ar = q1('SELECT title,level FROM alerts WHERE id=?', ev.alert_id)
+    emit('alert_resolved', {
+      alertId: ev.alert_id, alertEventId: ev.id, crisisId: c.id,
+      level: ar?.level || '', title: ar?.title || '预警', detail: '结案联动解除', note: summary, time: ts
+    })
+  }
+  emit('crisis_closed', {
+    crisisId: c.id, level: c.level, topic: c.topic, title: c.title,
+    detail: summary, note: summary, extra: { from: c.status, to: 'closed' }, time: ts
+  })
   res.json({ ok: true, resolved: opens.length, closureId })
 })
 
@@ -430,6 +475,11 @@ app.post('/api/crisis/:id/reopen', (req, res) => {
     try { db.exec('ROLLBACK') } catch { /* 已回滚 */ }
     return res.status(500).json({ error: String(e.message || e) })
   }
+  emit('crisis_status', {
+    crisisId: c.id, level: c.level, topic: c.topic, title: c.title,
+    detail: note || '结案回滚，事件重新打开',
+    extra: { from: 'closed', to: backTo, note: note || '结案回滚' }, time: ts
+  })
   res.json({ ok: true, restored, status: backTo })
 })
 app.delete('/api/crisis/:id', (req, res) => {
@@ -437,9 +487,230 @@ app.delete('/api/crisis/:id', (req, res) => {
   run('UPDATE alert_events SET crisis_id=NULL WHERE crisis_id=?', req.params.id)
   run('DELETE FROM crisis_timeline WHERE crisis_id=?', req.params.id)
   run('DELETE FROM crisis_closures WHERE crisis_id=?', req.params.id)
-  run('DELETE FROM crisis WHERE id=?', req.params.id)
+  run('DELETE FROM notify_tasks WHERE crisis_id=?', req.params.id) // 通知任务随事件清理
   res.json({ ok: true })
 })
+
+// ================= 多渠道订阅与通知编排 =================
+const jp = (v, d) => { try { const x = JSON.parse(v); return Array.isArray(x) ? x : d } catch { return d } }
+
+// 当前登录用户（前端顶栏切换角色用）
+app.get('/api/notify/me', (req, res) => res.json({ user: req.user }))
+app.get('/api/notify/users', (req, res) => {
+  res.json({ users: q('SELECT * FROM notify_users ORDER BY id') })
+})
+app.get('/api/notify/meta', (req, res) => {
+  res.json({
+    channelTypes: notify.CH_TYPES, eventTypes: notify.EVENT_TYPES,
+    channels: q('SELECT * FROM notify_channels ORDER BY id'),
+    subscriptions: subList(),
+    levels: { red: '红色', orange: '橙色', yellow: '黄色' },
+    users: q('SELECT id,name,role FROM notify_users ORDER BY id'),
+    summary: notify.notifySummary()
+  })
+})
+
+// ----- 渠道（admin 配置；operator 可启停/测试/演练失败率） -----
+app.get('/api/notify/channels', (req, res) => res.json({ channels: q('SELECT * FROM notify_channels ORDER BY id') }))
+app.post('/api/notify/channels', requirePerm('config'), (req, res) => {
+  const b = req.body || {}
+  if (!b.name || !b.type) return res.status(400).json({ error: '渠道名称与类型必填' })
+  if (!notify.CH_TYPES[b.type]) return res.status(400).json({ error: '未知渠道类型' })
+  const ts = now()
+  const r = run('INSERT INTO notify_channels (name,type,target,enabled,max_per_hour,sim_fail_rate,created) VALUES (?,?,?,?,?,?,?)',
+    String(b.name).trim(), b.type, (b.target || '').trim(), b.enabled === 0 ? 0 : 1,
+    Math.max(0, +b.max_per_hour || 0), Math.min(100, Math.max(0, +b.sim_fail_rate || 0)), ts)
+  res.json({ ok: true, id: Number(r.lastInsertRowid) })
+})
+app.put('/api/notify/channels/:id', requirePerm('config'), (req, res) => {
+  const ch = q1('SELECT * FROM notify_channels WHERE id=?', req.params.id)
+  if (!ch) return res.status(404).json({ error: '渠道不存在' })
+  const b = req.body || {}
+  run('UPDATE notify_channels SET name=?,type=?,target=?,max_per_hour=?,sim_fail_rate=? WHERE id=?',
+    b.name !== undefined ? String(b.name).trim() : ch.name,
+    notify.CH_TYPES[b.type] ? b.type : ch.type,
+    b.target !== undefined ? String(b.target).trim() : ch.target,
+    b.max_per_hour !== undefined ? Math.max(0, +b.max_per_hour || 0) : ch.max_per_hour,
+    b.sim_fail_rate !== undefined ? Math.min(100, Math.max(0, +b.sim_fail_rate || 0)) : ch.sim_fail_rate,
+    ch.id)
+  res.json({ ok: true })
+})
+// 启停 / 演练失败率：operator 可操作（不改核心配置）
+app.post('/api/notify/channels/:id/toggle', requirePerm('operate'), (req, res) => {
+  const ch = q1('SELECT * FROM notify_channels WHERE id=?', req.params.id)
+  if (!ch) return res.status(404).json({ error: '渠道不存在' })
+  run('UPDATE notify_channels SET enabled=? WHERE id=?', ch.enabled ? 0 : 1, ch.id)
+  res.json({ ok: true, enabled: ch.enabled ? 0 : 1 })
+})
+app.post('/api/notify/channels/:id/sim-rate', requirePerm('operate'), (req, res) => {
+  const rate = Math.min(100, Math.max(0, parseInt(req.body?.rate, 10) || 0))
+  run('UPDATE notify_channels SET sim_fail_rate=? WHERE id=?', rate, req.params.id)
+  res.json({ ok: true, rate })
+})
+app.post('/api/notify/channels/:id/test', requirePerm('channelTest'), async (req, res) => {
+  const ch = q1('SELECT * FROM notify_channels WHERE id=?', req.params.id)
+  if (!ch) return res.status(404).json({ error: '渠道不存在' })
+  try {
+    const r = await notify.channelSend(ch, { title: '渠道连通性测试', body: `由 ${req.user.name} 发起的测试投递` })
+    res.json({ ok: true, ...r })
+  } catch (e) {
+    res.status(502).json({ ok: false, error: String(e.message || e) })
+  }
+})
+app.delete('/api/notify/channels/:id', requirePerm('config'), (req, res) => {
+  const ch = q1('SELECT * FROM notify_channels WHERE id=?', req.params.id)
+  if (!ch) return res.status(404).json({ error: '渠道不存在' })
+  const pending = q1("SELECT COUNT(*) c FROM notify_tasks WHERE channel_id=? AND status IN ('pending','sending','paused')", ch.id).c
+  if (pending) return res.status(409).json({ error: `该渠道还有 ${pending} 个待发送/暂停任务，请先处理` })
+  run('DELETE FROM notify_channels WHERE id=?', ch.id)
+  res.json({ ok: true })
+})
+
+// ----- 订阅（admin 增删改；operator 可暂停/恢复） -----
+function subList() {
+  return q('SELECT * FROM notify_subscriptions ORDER BY id DESC').map((s) => ({
+    ...s,
+    event_types: jp(s.event_types, []),
+    alert_ids: jp(s.alert_ids, []),
+    channel_ids: jp(s.channel_ids, []),
+    escalate_to: jp(s.escalate_to, [])
+  }))
+}
+app.get('/api/notify/subscriptions', (req, res) => res.json({ subscriptions: subList() }))
+function normalizeSub(b, cur = {}) {
+  const level = ['red', 'orange', 'yellow'].includes(b.min_level) ? b.min_level : (cur.min_level || 'yellow')
+  return {
+    name: String(b.name ?? cur.name ?? '').trim(),
+    owner_id: b.owner_id ? +b.owner_id : (cur.owner_id ?? null),
+    event_types: JSON.stringify(Array.isArray(b.event_types) ? b.event_types : jp(cur.event_types, ['alert_fired'])),
+    alert_ids: JSON.stringify(Array.isArray(b.alert_ids) ? b.alert_ids.map(Number) : jp(cur.alert_ids, [])),
+    topics: String(b.topics ?? cur.topics ?? '').trim(),
+    min_level: level,
+    crisis_status: String(b.crisis_status ?? cur.crisis_status ?? '').trim(),
+    channel_ids: JSON.stringify(Array.isArray(b.channel_ids) ? b.channel_ids.map(Number) : jp(cur.channel_ids, [])),
+    ack_timeout_min: Math.max(0, parseInt(b.ack_timeout_min ?? cur.ack_timeout_min ?? 30, 10) || 0),
+    escalate_to: JSON.stringify(Array.isArray(b.escalate_to) ? b.escalate_to.map(Number) : jp(cur.escalate_to, [])),
+    quiet_start: String(b.quiet_start ?? cur.quiet_start ?? '').trim(),
+    quiet_end: String(b.quiet_end ?? cur.quiet_end ?? '').trim()
+  }
+}
+app.post('/api/notify/subscriptions', requirePerm('config'), (req, res) => {
+  const v = normalizeSub(req.body || {})
+  if (!v.name) return res.status(400).json({ error: '订阅名称必填' })
+  if (!jp(v.channel_ids, []).length) return res.status(400).json({ error: '至少选择一个通知渠道' })
+  const ts = now()
+  const r = run(`INSERT INTO notify_subscriptions
+    (name,owner_id,event_types,alert_ids,topics,min_level,crisis_status,channel_ids,ack_timeout_min,escalate_to,quiet_start,quiet_end,active,created,updated)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1,?,?)`,
+    v.name, v.owner_id, v.event_types, v.alert_ids, v.topics, v.min_level, v.crisis_status,
+    v.channel_ids, v.ack_timeout_min, v.escalate_to, v.quiet_start, v.quiet_end, ts, ts)
+  res.json({ ok: true, id: Number(r.lastInsertRowid) })
+})
+app.put('/api/notify/subscriptions/:id', requirePerm('config'), (req, res) => {
+  const s = q1('SELECT * FROM notify_subscriptions WHERE id=?', req.params.id)
+  if (!s) return res.status(404).json({ error: '订阅不存在' })
+  const v = normalizeSub(req.body || {}, s)
+  if (!v.name) return res.status(400).json({ error: '订阅名称必填' })
+  if (!jp(v.channel_ids, []).length) return res.status(400).json({ error: '至少选择一个通知渠道' })
+  run(`UPDATE notify_subscriptions SET name=?,owner_id=?,event_types=?,alert_ids=?,topics=?,min_level=?,
+    crisis_status=?,channel_ids=?,ack_timeout_min=?,escalate_to=?,quiet_start=?,quiet_end=?,updated=? WHERE id=?`,
+    v.name, v.owner_id, v.event_types, v.alert_ids, v.topics, v.min_level, v.crisis_status,
+    v.channel_ids, v.ack_timeout_min, v.escalate_to, v.quiet_start, v.quiet_end, now(), s.id)
+  res.json({ ok: true })
+})
+// 暂停/恢复订阅：仅影响后续触发（恢复后不补发），已有任务保持各自状态
+app.post('/api/notify/subscriptions/:id/toggle', requirePerm('operate'), (req, res) => {
+  const s = q1('SELECT * FROM notify_subscriptions WHERE id=?', req.params.id)
+  if (!s) return res.status(404).json({ error: '订阅不存在' })
+  const active = s.active ? 0 : 1
+  run('UPDATE notify_subscriptions SET active=?, updated=? WHERE id=?', active, now(), s.id)
+  res.json({ ok: true, active })
+})
+app.delete('/api/notify/subscriptions/:id', requirePerm('config'), (req, res) => {
+  const s = q1('SELECT * FROM notify_subscriptions WHERE id=?', req.params.id)
+  if (!s) return res.status(404).json({ error: '订阅不存在' })
+  const pending = q1("SELECT COUNT(*) c FROM notify_tasks WHERE sub_id=? AND status IN ('pending','sending','paused','sent')", s.id).c
+  if (pending) return res.status(409).json({ error: `该订阅还有 ${pending} 个在途/待回执任务，请先处理或保留订阅（仅暂停）` })
+  run('DELETE FROM notify_task_logs WHERE task_id IN (SELECT id FROM notify_tasks WHERE sub_id=?)', s.id)
+  run('DELETE FROM notify_tasks WHERE sub_id=?', s.id)
+  run('DELETE FROM notify_subscriptions WHERE id=?', s.id)
+  res.json({ ok: true })
+})
+
+// ----- 通知任务（发送编排/重试/升级/回执/历史） -----
+app.get('/api/notify/tasks', (req, res) => {
+  res.json({ tasks: notify.listTasks(req.query), summary: notify.notifySummary() })
+})
+app.get('/api/notify/tasks/:id', (req, res) => {
+  const d = notify.getTask(+req.params.id)
+  if (!d) return res.status(404).json({ error: '任务不存在' })
+  res.json(d)
+})
+// 确认回执：viewer 亦可（订阅人确认收到）；可联动解除预警，时间线由引擎同步
+app.post('/api/notify/tasks/:id/ack', (req, res) => {
+  const d = notify.getTask(+req.params.id)
+  if (!d) return res.status(404).json({ error: '任务不存在' })
+  if (!['sent', 'escalated', 'sending', 'paused', 'failed'].includes(d.task.status)) {
+    return res.status(400).json({ error: `当前状态「${d.task.statusText}」无需确认` })
+  }
+  try {
+    const r = notify.ackTask(d.task.id, {
+      note: String(req.body?.note || '').trim(),
+      by: req.user.name,
+      resolveAlert: !!req.body?.resolve_alert
+    })
+    res.json(r)
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) })
+  }
+})
+app.post('/api/notify/tasks/:id/pause', requirePerm('operate'), (req, res) => {
+  const t = notify.pauseTask(+req.params.id, req.user.name)
+  if (!t) return res.status(404).json({ error: '任务不存在' })
+  res.json({ ok: true, task: t })
+})
+app.post('/api/notify/tasks/:id/resume', requirePerm('operate'), (req, res) => {
+  const t = notify.resumeTask(+req.params.id, req.user.name)
+  if (!t) return res.status(404).json({ error: '任务不存在' })
+  res.json({ ok: true, task: t })
+})
+app.post('/api/notify/tasks/:id/cancel', requirePerm('operate'), (req, res) => {
+  const t = notify.cancelTask(+req.params.id, req.user.name)
+  if (!t) return res.status(404).json({ error: '任务不存在' })
+  res.json({ ok: true, task: t })
+})
+app.post('/api/notify/tasks/:id/retry', requirePerm('operate'), (req, res) => {
+  const t = notify.retryTask(+req.params.id, req.user.name)
+  if (!t) return res.status(404).json({ error: '任务不存在' })
+  res.json({ ok: true, task: t })
+})
+app.post('/api/notify/tasks/:id/escalate', requirePerm('operate'), (req, res) => {
+  const r = notify.forceEscalate(+req.params.id, req.user.name)
+  if (!r) return res.status(404).json({ error: '任务不存在' })
+  if (!r.ok) return res.status(400).json({ error: '升级链已到末端（没有更多升级渠道）' })
+  res.json({ ok: true })
+})
+app.delete('/api/notify/tasks/:id', requirePerm('purge'), (req, res) => {
+  const t = q1('SELECT * FROM notify_tasks WHERE id=?', req.params.id)
+  if (!t) return res.status(404).json({ error: '任务不存在' })
+  if (['pending', 'sending'].includes(t.status)) return res.status(409).json({ error: '在途任务请先取消再删除' })
+  run('DELETE FROM notify_task_logs WHERE task_id=?', t.id)
+  run('DELETE FROM notify_tasks WHERE id=?', t.id)
+  res.json({ ok: true })
+})
+// 历史清理：清空 30 天前已完结任务（admin）
+app.post('/api/notify/history/purge', requirePerm('purge'), (req, res) => {
+  const days = Math.max(1, +req.body?.days || 30)
+  const cutoffMs = Date.now() - days * 86400_000
+  const olds = q("SELECT id FROM notify_tasks WHERE status IN ('acked','failed','canceled','escalated')")
+    .filter((t) => (parseTimeMs(t.updated) || 0) < cutoffMs)
+  for (const t of olds) {
+    run('DELETE FROM notify_task_logs WHERE task_id=?', t.id)
+    run('DELETE FROM notify_tasks WHERE id=?', t.id)
+  }
+  res.json({ ok: true, purged: olds.length })
+})
+app.get('/api/notify/summary', (req, res) => res.json(notify.notifySummary()))
 
 const PORT = Number(process.env.PORT) || 4130
 app.listen(PORT, () => console.log(`[PUBMON] API running at http://localhost:${PORT}`))

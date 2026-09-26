@@ -135,6 +135,89 @@ CREATE TABLE IF NOT EXISTS import_job_items (
 CREATE INDEX IF NOT EXISTS idx_import_job_items_job ON import_job_items (job_id, status);
 CREATE INDEX IF NOT EXISTS idx_import_job_items_key ON import_job_items (idem_key);
 -- 注：posts.idem_key 索引在下方 ensureColumn 之后创建（旧库可能尚无该列，此处创建会导致启动失败）
+
+-- ===== 多渠道舆情订阅与通知编排 =====
+-- 通知用户（RBAC：viewer 只读 / operator 处置 / admin 配置与权限）
+CREATE TABLE IF NOT EXISTS notify_users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL UNIQUE,
+  role TEXT NOT NULL DEFAULT 'viewer'  -- viewer/operator/admin
+);
+-- 通知渠道：邮件/短信/企微/钉钉/Webhook，mock 发送；可启停、限速、演练注入故障
+CREATE TABLE IF NOT EXISTS notify_channels (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  type TEXT NOT NULL,             -- email/sms/wecom/dingtalk/webhook
+  target TEXT NOT NULL DEFAULT '',-- 收件地址（邮箱/手机号/群机器人 URL）
+  enabled INTEGER NOT NULL DEFAULT 1,
+  max_per_hour INTEGER NOT NULL DEFAULT 0, -- 限速（条/小时，0=不限）
+  sent_ok INTEGER NOT NULL DEFAULT 0,
+  sent_fail INTEGER NOT NULL DEFAULT 0,
+  sim_fail_rate INTEGER NOT NULL DEFAULT 0,-- 演练用：每轮失败概率 0-100（验证重试/升级）
+  created TEXT NOT NULL
+);
+-- 订阅规则：按预警规则/话题/级别/危机状态匹配；确认时限与升级链编排；可暂停
+CREATE TABLE IF NOT EXISTS notify_subscriptions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  owner_id INTEGER,                       -- 订阅人（notify_users.id）
+  event_types TEXT NOT NULL DEFAULT '[]', -- [alert_fired,alert_resolved,crisis_created,crisis_status,crisis_closed]
+  alert_ids TEXT NOT NULL DEFAULT '[]',   -- 预警规则 id 列表（空=全部规则）
+  topics TEXT NOT NULL DEFAULT '',        -- 话题，逗号分隔（空=不限话题）
+  min_level TEXT NOT NULL DEFAULT 'yellow', -- red/orange/yellow（级别排序，命中≥该级别）
+  crisis_status TEXT NOT NULL DEFAULT '', -- 危机状态过滤 monitoring/disposal/closed（空=不限）
+  channel_ids TEXT NOT NULL DEFAULT '[]', -- 编排渠道（按顺序逐渠道生成任务）
+  ack_timeout_min INTEGER NOT NULL DEFAULT 30, -- 确认时限：超时未回执 → 升级
+  escalate_to TEXT NOT NULL DEFAULT '[]', -- 升级渠道 id 列表（逐级升级）
+  quiet_start TEXT NOT NULL DEFAULT '',   -- 静默开始 HH:MM（空=不静默）
+  quiet_end TEXT NOT NULL DEFAULT '',     -- 静默结束 HH:MM（跨夜如 23:00→07:00）
+  active INTEGER NOT NULL DEFAULT 1,      -- 0=暂停订阅（新触发不编排，恢复后不补发）
+  created TEXT NOT NULL,
+  updated TEXT NOT NULL
+);
+-- 通知任务：一次事件命中订阅后，按渠道逐渠道生成；批次键标识同一次编排
+CREATE TABLE IF NOT EXISTS notify_tasks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  batch_key TEXT NOT NULL,         -- 同一次事件编排的多渠道任务共享（含事件类型+来源id）
+  sub_id INTEGER NOT NULL,
+  channel_id INTEGER NOT NULL,
+  event_type TEXT NOT NULL,        -- alert_fired/alert_resolved/crisis_created/crisis_status/crisis_closed
+  alert_event_id INTEGER,          -- 关联预警触发记录（回执联动解除用）
+  crisis_id INTEGER,               -- 关联危机事件（回执同步时间线用）
+  level TEXT NOT NULL DEFAULT '',
+  title TEXT NOT NULL,
+  body TEXT NOT NULL DEFAULT '',
+  target TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'pending', -- pending/sending/sent/acked/failed/escalated/canceled/paused
+  attempts INTEGER NOT NULL DEFAULT 0,
+  max_attempts INTEGER NOT NULL DEFAULT 3,
+  next_retry_at INTEGER,           -- 毫秒时间戳：退避后可重试
+  ack_deadline INTEGER,            -- 确认时限（毫秒），仅首条渠道需要回执
+  acked_at TEXT,
+  acked_by TEXT NOT NULL DEFAULT '',
+  ack_note TEXT NOT NULL DEFAULT '',
+  ack_resolve_alert INTEGER NOT NULL DEFAULT 0, -- 回执时是否联动解除关联预警
+  escalate_from INTEGER,           -- 升级来源任务 id（构成升级链）
+  escalate_level INTEGER NOT NULL DEFAULT 0,    -- 第几级升级（0=原始渠道）
+  paused_reason TEXT NOT NULL DEFAULT '',
+  last_error TEXT NOT NULL DEFAULT '',
+  created TEXT NOT NULL,
+  updated TEXT NOT NULL,
+  sent_at TEXT,
+  done_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_notify_tasks_status ON notify_tasks (status, next_retry_at, ack_deadline);
+CREATE INDEX IF NOT EXISTS idx_notify_tasks_batch ON notify_tasks (batch_key);
+-- 逐次投递日志：发送/重试/失败/回执/升级/暂停/取消全程留痕（历史追踪）
+CREATE TABLE IF NOT EXISTS notify_task_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id INTEGER NOT NULL,
+  action TEXT NOT NULL,            -- created/send_ok/send_fail/retry/escalate/ack/pause/resume/cancel
+  note TEXT NOT NULL DEFAULT '',
+  by TEXT NOT NULL DEFAULT '',     -- 操作人（人工动作）
+  time TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_notify_task_logs_task ON notify_task_logs (task_id, id);
 `)
 
 // 把 toLocaleString('zh-CN') 形如「2026/9/26 01:54:38」解析为毫秒时间戳（迁移/窗口计算用）
@@ -350,3 +433,99 @@ function seed() {
     ['事件结案', '舆情热度回落至常态区间，负面占比降至 5% 以下，完成处置闭环。', ago(2840)]].forEach((t) => ct.run(c3, t[0], t[1], t[2]))
 }
 seed()
+
+// ===== 通知体系基础数据（新旧库幂等补齐） =====
+// 用户/渠道/订阅在表为空时补建；历史演示任务仅在完全没有任务时补建一次。
+function ensureNotifyBase() {
+  const nowStr = new Date().toLocaleString('zh-CN')
+  const userCnt = db.prepare('SELECT COUNT(*) c FROM notify_users').get().c
+  let uidAdmin, uidOp, uidViewer
+  if (!userCnt) {
+    const ui = db.prepare('INSERT INTO notify_users (name,role) VALUES (?,?)')
+    uidAdmin = Number(ui.run('系统管理员', 'admin').lastInsertRowid)
+    uidOp = Number(ui.run('值班主管', 'operator').lastInsertRowid)
+    uidViewer = Number(ui.run('舆情观察员', 'viewer').lastInsertRowid)
+  } else {
+    const us = Object.fromEntries(db.prepare('SELECT id,role FROM notify_users').all().map((u) => [u.role, u.id]))
+    uidAdmin = us.admin; uidOp = us.operator; uidViewer = us.viewer
+  }
+
+  const chCnt = db.prepare('SELECT COUNT(*) c FROM notify_channels').get().c
+  let channels = []
+  if (!chCnt) {
+    const ci = db.prepare('INSERT INTO notify_channels (name,type,target,enabled,max_per_hour,sent_ok,sent_fail,sim_fail_rate,created) VALUES (?,?,?,1,?,?,?,0,?)')
+    const add = (name, type, target, mph, ok, fail) =>
+      Number(ci.run(name, type, target, mph, ok, fail, nowStr).lastInsertRowid)
+    const chEmail = add('值班邮箱', 'email', 'duty@brand.com', 0, 12, 1)
+    const chSms = add('预警短信', 'sms', '13800000000', 50, 8, 2)
+    const chWecom = add('企微应急群', 'wecom', 'https://qyapi.weixin.demo/cgi-bin/webhook/duty', 0, 21, 0)
+    const chDing = add('钉钉值班群', 'dingtalk', 'https://oapi.dingtalk.demo/robot/send/duty', 0, 15, 1)
+    const chEsc = add('升级响应组(电话+Webhook)', 'webhook', 'https://hooks.demo/escalate/lead', 0, 3, 0)
+    channels = { chEmail, chSms, chWecom, chDing, chEsc }
+  } else {
+    const rows = db.prepare('SELECT id,type FROM notify_channels').all()
+    const byType = Object.fromEntries(rows.map((r) => [r.type, r.id]))
+    channels = {
+      chEmail: byType.email || rows[0].id, chSms: byType.sms || rows[0].id,
+      chWecom: byType.wecom || rows[0].id, chDing: byType.dingtalk || rows[0].id,
+      chEsc: byType.webhook || rows[0].id
+    }
+  }
+
+  if (!db.prepare('SELECT COUNT(*) c FROM notify_subscriptions').get().c) {
+    const si = db.prepare(`INSERT INTO notify_subscriptions
+      (name,owner_id,event_types,alert_ids,topics,min_level,crisis_status,channel_ids,ack_timeout_min,escalate_to,quiet_start,quiet_end,active,created,updated)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1,?,?)`)
+    // 红色：全事件（触发/建档/状态/结案），企微+短信双通道，30 分钟回执，超时升级
+    si.run('红色危机·领导即时通报', uidAdmin,
+      JSON.stringify(['alert_fired', 'alert_resolved', 'crisis_created', 'crisis_status', 'crisis_closed']),
+      '[]', '', 'red', '', JSON.stringify([channels.chWecom, channels.chSms]), 30,
+      JSON.stringify([channels.chEsc]), '', '', nowStr, nowStr)
+    // 橙色：预警触发+自动建档，邮件+企微，60 分钟回执
+    si.run('橙色预警·值班订阅', uidOp,
+      JSON.stringify(['alert_fired', 'crisis_created']),
+      '[]', '', 'orange', '', JSON.stringify([channels.chWecom, channels.chEmail]), 60,
+      JSON.stringify([channels.chSms]), '23:00', '07:00', nowStr, nowStr)
+    // 黄色：观察员只读视角（仅本人回执/查看，不能改配置）
+    si.run('黄色舆情·观察同步', uidViewer,
+      JSON.stringify(['alert_fired']),
+      '[]', '', 'yellow', '', JSON.stringify([channels.chEmail]), 120,
+      '[]', '', '', nowStr, nowStr)
+    // 危机状态流转跟踪（不限级别）
+    si.run('危机处置流转跟踪', uidOp,
+      JSON.stringify(['crisis_status', 'crisis_closed']),
+      '[]', '', 'yellow', '', JSON.stringify([channels.chDing]), 0,
+      '[]', '', '', nowStr, nowStr)
+  }
+
+  // 历史演示任务：仅空表时补建两条终态任务（已回执 / 发送失败），展示完整历史链路
+  if (!db.prepare('SELECT COUNT(*) c FROM notify_tasks').get().c) {
+    const sub = db.prepare("SELECT id FROM notify_subscriptions WHERE name='橙色预警·值班订阅'").get()
+    const ev = db.prepare("SELECT ae.*, a.title atitle, c.id cid FROM alert_events ae JOIN alerts a ON a.id=ae.alert_id LEFT JOIN crisis c ON c.id=ae.crisis_id WHERE ae.status='open' ORDER BY ae.id ASC LIMIT 1").get()
+    if (sub && ev) {
+      const agoMs = (m) => new Date(Date.now() - m * 60000).toLocaleString('zh-CN')
+      const ti = db.prepare(`INSERT INTO notify_tasks
+        (batch_key,sub_id,channel_id,event_type,alert_event_id,crisis_id,level,title,body,target,status,attempts,max_attempts,acked_at,acked_by,ack_note,created,updated,sent_at,done_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      const li = db.prepare('INSERT INTO notify_task_logs (task_id,action,note,by,time) VALUES (?,?,?,?,?)')
+      const batch = `seed:alert:${ev.id}`
+      const t1 = Number(ti.run(batch, sub.id, channels.chWecom, 'alert_fired', ev.id, ev.cid, 'orange',
+        `【橙色预警】${ev.atitle}`, ev.detail, '企微应急群', 'acked', 1, 3,
+        agoMs(40), '值班主管', '已知悉，已联系门店负责人现场核实',
+        agoMs(95), agoMs(95), agoMs(94), agoMs(40)).lastInsertRowid)
+      li.run(t1, 'created', '预警触发命中订阅「橙色预警·值班订阅」，编排渠道：企微应急群、值班邮箱', '系统', agoMs(95))
+      li.run(t1, 'send_ok', '消息推送成功（22 人已读）', '', agoMs(94))
+      li.run(t1, 'ack', '值班主管 确认回执：已知悉，已联系门店负责人现场核实', '值班主管', agoMs(40))
+      const t2 = Number(ti.run(batch, sub.id, channels.chEmail, 'alert_fired', ev.id, ev.cid, 'orange',
+        `【橙色预警】${ev.atitle}`, ev.detail, 'duty@brand.com', 'failed', 3, 3,
+        null, '', '', agoMs(95), agoMs(88), null, agoMs(88)).lastInsertRowid)
+      li.run(t2, 'created', '同批次编排渠道：值班邮箱', '系统', agoMs(95))
+      li.run(t2, 'send_fail', 'SMTP 连接超时（第 1 次），30 秒后重试', '', agoMs(94))
+      li.run(t2, 'retry', '退避重试中（第 2 次）', '', agoMs(93))
+      li.run(t2, 'send_fail', 'SMTP 连接超时（第 2 次），60 秒后重试', '', agoMs(93))
+      li.run(t2, 'retry', '退避重试中（第 3 次）', '', agoMs(90))
+      li.run(t2, 'send_fail', 'SMTP 554 发送被拒（已达 3 次上限），可在订阅中配置升级渠道', '', agoMs(88))
+    }
+  }
+}
+ensureNotifyBase()

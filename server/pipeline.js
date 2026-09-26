@@ -1,4 +1,5 @@
 import { db, parseTimeMs } from './db.js'
+import { emit } from './event-bus.js'
 
 const q = (sql, ...p) => db.prepare(sql).all(...p)
 const q1 = (sql, ...p) => db.prepare(sql).get(...p)
@@ -129,6 +130,10 @@ export function checkAlerts(postId) {
             ? `${detail} · 关联舆情《${p.title}》`
             : `承接规则「${al.title}」（${LV_TEXT[al.level]}）：${detail} · 关联舆情《${p.title}》`) +
           (escalate ? ` · 事件级别上调：${LV_TEXT[open.level]}→${LV_TEXT[al.level]}` : ''), ts)
+        if (!linked) emit('crisis_created', {
+          crisisId: open.id, alertId: al.id, level: al.level, topic,
+          title: open.title, detail: `事件「${open.title}」承接规则「${al.title}」（${LV_TEXT[al.level]}）：${detail}`, time: ts
+        })
       } else {
         const r = run('INSERT INTO crisis (title,level,status,plan,analysis,created,updated,linked_email,keyword,alert_id,origin,topic,last_trigger_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
           al.title, al.level, 'monitoring', '',
@@ -137,11 +142,20 @@ export function checkAlerts(postId) {
         crisisId = Number(r.lastInsertRowid)
         attachRule(crisisId, al.id, true, ts)
         addTimeline(crisisId, '自动建档', `高等级预警触发：${detail}`, ts)
+        emit('crisis_created', {
+          crisisId, alertId: al.id, level: al.level, topic,
+          title: al.title, detail: `高等级预警触发自动建档：${detail} · 话题「${topic}」 · 关联舆情《${p.title}》`, time: ts
+        })
       }
     }
     const ev = run('INSERT INTO alert_events (alert_id,post_id,crisis_id,detail,time,status,resolved) VALUES (?,?,?,?,?,?,?)',
       al.id, postId, crisisId, detail, ts, 'open', null)
     fired.push({ alert: al.title, level: al.level, eventId: Number(ev.lastInsertRowid), crisisId, deduped, topic })
+    // 通知编排：预警触发事件（订阅匹配/任务生成由通知引擎消费，失败不影响主链路）
+    emit('alert_fired', {
+      alertId: al.id, alertEventId: Number(ev.lastInsertRowid), postId, crisisId,
+      level: al.level, topic, title: al.title, detail, time: ts
+    })
   }
   return fired
 }

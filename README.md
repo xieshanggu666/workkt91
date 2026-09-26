@@ -23,6 +23,7 @@ npm run dev
 - **舆情列表**：按情感/渠道/关键词筛选，录入新舆情自动进行情感分析，负面舆情触发预警提示；支持可恢复批量导入（任务化、断点续跑、失败重试、进度与逐条结果回写）
 - **预警中心**：预警规则配置与**编辑**（级别/关键词/情感/热度下限/归并话题/时间窗口），规则启停、触发记录与关联舆情、单条/批量解除预警（**幂等**，重复解除不产生重复时间线）
 - **危机处置**：事件建档（话题+方案+研判+邮箱）、状态流转（监测→处置→结案）、处置时间线、动作记录、事件回溯（按规则拆分统计、结案档案）与结案总结，**结案可回滚**
+- **通知编排**：多渠道（邮件/短信/企微/钉钉/Webhook，mock 投递）订阅配置、按规则/话题/级别/危机状态匹配、静默时段、确认时限与升级链编排；生成**可暂停的通知任务**，支持发送、指数退避失败重试、确认回执（同步预警解除与危机时间线）、超时/失败自动升级；三级 RBAC 权限与全量投递历史追踪
 
 ## 预警 → 危机闭环
 
@@ -50,12 +51,26 @@ npm run dev
 - 演练用请求头：`x-sim-fail: 2,5`（指定条目首轮瞬时失败，验证自动重试）、`x-sim-fail-always: 5`（持续失败，验证 failed → 手动重试）、续跑时带 `x-clear-injection: 1`
 - `POST /api/posts/batch`（旧接口，≤200 条）保持同步语义，内部改为创建任务并等待结束，响应结构不变（部分失败返回 207）；`POST /api/posts` 单条录入支持可选 `idem_key`，响应结构不变
 
+## 多渠道订阅与通知编排
+
+- **事件总线**（`server/event-bus.js`）：预警触发/解除、危机建档/状态流转/结案五类业务事件在事务提交后发布；通知侧订阅消费，**通知异常绝不阻断录入/处置主链路**
+- **订阅匹配**（`notify_subscriptions`）：按事件类型、预警规则、话题（逗号分隔模糊匹配）、最低级别（红>橙>黄）、危机状态过滤；一条订阅按序编排多个渠道，同一次事件共享 `batch_key`；事件×订阅维度**编排幂等**，重复提交不产生重复任务
+- **可暂停任务**（`notify_tasks`）：订阅暂停仅影响后续触发且恢复不补发，其在途任务挂起不发送；单任务可暂停/恢复/取消；**静默时段**（如 23:00–07:00，支持跨夜）期间任务暂存为 paused，窗口结束后由调度器自动恢复
+- **发送与失败重试**：mock 渠道投递（120–340ms 随机延迟），失败按 10s/30s 指数退避自动重试（默认 3 次），达上限转 failed；渠道支持每小时限速（超限自动延后）；调度器每秒扫描待发/退避到期任务，重启时 sending 中断任务自动回 pending
+- **确认回执与升级**：订阅可配确认时限（15/30/60/120 分钟）与逐级升级链；超时未回执或渠道发送失败均自动创建下一级升级任务（跳过静默限制），同批次并行渠道只产生一个升级任务，升级到链末端停止；支持手动「立即升级」
+- **回执同步闭环**：确认为**批次级**（任一渠道确认，同批已送达任务统一置已回执、未发出的取消）；回执写入危机统一时间线「通知确认」；可选**联动解除关联预警**（`resolve_kind='ack'`，状态守卫幂等）并同步「预警解除」时间线，再发布解除事件通知其他订阅人
+- **反向同步**：预警在预警中心手动/批量解除、危机结案级联解除时，对应待办通知（pending/paused/sending）自动取消（已送达的保留留痕），同时按订阅编排「预警解除 / 危机结案」通报；结案回滚发布危机状态流转通知
+- **权限（RBAC）**：`notify_users` 三级角色，请求头 `x-user-id`（缺省回落值班员，兼容 curl 旧调用方）：**观察员 viewer** 只读 + 回执；**值班员 operator** + 暂停/恢复/重试/取消/手动升级/渠道测试/故障注入；**管理员 admin** + 渠道与订阅增删改/历史清理
+- **历史追踪**：`notify_task_logs` 逐次留痕（created/send_ok/send_fail/retry/escalate/ack/pause/resume/cancel，含操作人、provider 回执、错误原因），任务详情可看同批次多渠道编排与升级链；admin 可清理 30 天前已完结任务
+- 主要接口：`GET /api/notify/meta|summary|me|users`、渠道 `GET/POST/PUT/DELETE /api/notify/channels`（`/toggle`、`/:id/test`、`/:id/sim-rate`）、订阅 `GET/POST/PUT/DELETE /api/notify/subscriptions`（`/:id/toggle`）、任务 `GET /api/notify/tasks`（`status/event_type/channel_id/sub_id/crisis_id/q` 过滤）、`GET /api/notify/tasks/:id`、`/:id/ack|pause|resume|cancel|retry|escalate`、`POST /api/notify/history/purge`
+- 演练：渠道详情可一键「注入 100% 失败」验证退避重试与失败升级，或设置失败率百分比；确认时限超时可用「立即升级」模拟
+
 ## 数据库表
 
-`sources` `posts`（含 `idem_key` 幂等键） `hot_words` `alerts` `alert_events`（含 `resolve_kind` 解除途径） `crisis` `crisis_alerts` `crisis_timeline` `crisis_closures`（结案档案：联动解除清单、结案前状态、回滚记录） `import_jobs` `import_job_items`（可恢复导入任务与逐条记录）
+`sources` `posts`（含 `idem_key` 幂等键） `hot_words` `alerts` `alert_events`（含 `resolve_kind` 解除途径） `crisis` `crisis_alerts` `crisis_timeline` `crisis_closures`（结案档案：联动解除清单、结案前状态、回滚记录） `import_jobs` `import_job_items`（可恢复导入任务与逐条记录） `notify_users` `notify_channels` `notify_subscriptions` `notify_tasks` `notify_task_logs`（多渠道订阅、可暂停通知任务与投递历史）
 
-> 旧库自动迁移：新增 `alerts.merge_topic/merge_window`、`crisis.topic/last_trigger_at` 列，并把旧的 `crisis.alert_id` 单规则关联迁移到多对多表 `crisis_alerts`（回填话题与最近触发时间），历史时间线原样保留；新增 `posts.idem_key` 列与索引（索引在补列之后创建，更早期无该列的库也可启动），并自动重建早期版本的 `import_job_items.idem_key` 唯一约束为普通索引（支持跨任务同名幂等键）；新增 `alert_events.resolve_kind` 列与 `crisis_closures` 结案档案表，并为历史已结案事件从时间线「事件结案」记录补建结案档案（联动解除清单无法追溯置空，此类结案回滚时仅恢复事件状态）。
+> 旧库自动迁移：新增 `alerts.merge_topic/merge_window`、`crisis.topic/last_trigger_at` 列，并把旧的 `crisis.alert_id` 单规则关联迁移到多对多表 `crisis_alerts`（回填话题与最近触发时间），历史时间线原样保留；新增 `posts.idem_key` 列与索引（索引在补列之后创建，更早期无该列的库也可启动），并自动重建早期版本的 `import_job_items.idem_key` 唯一约束为普通索引（支持跨任务同名幂等键）；新增 `alert_events.resolve_kind` 列与 `crisis_closures` 结案档案表，并为历史已结案事件从时间线「事件结案」记录补建结案档案（联动解除清单无法追溯置空，此类结案回滚时仅恢复事件状态）。通知模块五张新表（`notify_users/channels/subscriptions/tasks/task_logs`）首次启动自动建表，并幂等补建演示用户、渠道、订阅与两条历史任务。
 
 ## 后续可扩展
 
-更多数据源、报告导出、KOL/传播路径分析、定制提醒（邮件/短信占位）、定期周报、权限与审计、二级审核、AI 摘要、历史趋势对比
+更多数据源、报告导出、KOL/传播路径分析、定期周报、二级审核、AI 摘要、历史趋势对比、真实渠道网关对接（SMTP/短信/群机器人签名）、通知模板与频控聚合、回执 SLA 报表

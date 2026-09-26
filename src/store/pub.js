@@ -14,7 +14,9 @@ export const usePubStore = defineStore('pub', {
   state: () => ({
     loaded: false,
     sources: [], hotWords: [], activeAlerts: [], crises: [], stats: {}, trend: [],
-    toast: null
+    toast: null,
+    // 通知编排
+    user: null, users: [], notifyMeta: null
   }),
   actions: {
     async load() {
@@ -85,6 +87,42 @@ export const usePubStore = defineStore('pub', {
       else this.msg(r.restored ? `已回滚结案，恢复 ${r.restored} 条未解除预警` : '已回滚结案，事件重新打开', 'success')
       return r
     },
-    async delCrisis(id) { await api('/crisis/' + id, 'DELETE'); await this.load() }
+    async delCrisis(id) { await api('/crisis/' + id, 'DELETE'); await this.load() },
+
+    // ===== 多渠道订阅与通知编排 =====
+    authHeaders() { return this.user ? { 'x-user-id': this.user.id } : {} },
+    async loadMe() {
+      this.user = (await api('/notify/me')).user
+      const { users } = await api('/notify/users')
+      this.users = users
+    },
+    async switchUser(id) {
+      this.user = this.users.find((u) => u.id === id) || null
+      await this.loadMe()
+    },
+    async loadNotifyMeta() { this.notifyMeta = await api('/notify/meta'); return this.notifyMeta },
+    napi(path, method = 'GET', body, qs) { return api('/notify' + path, method, body, qs, this.authHeaders()) },
+    // 渠道
+    saveChannel(c) { return this.napi('/channels', c.id ? 'PUT' : 'POST', c) },
+    toggleChannel(id) { return this.napi(`/channels/${id}/toggle`, 'POST') },
+    setChannelSimRate(id, rate) { return this.napi(`/channels/${id}/sim-rate`, 'POST', { rate }) },
+    testChannel(id) { return this.napi(`/channels/${id}/test`, 'POST') },
+    delChannel(id) { return this.napi('/channels/' + id, 'DELETE') },
+    // 订阅
+    saveSub(s) { return this.napi('/subscriptions', s.id ? 'PUT' : 'POST', s) },
+    toggleSub(id) { return this.napi(`/subscriptions/${id}/toggle`, 'POST') },
+    delSub(id) { return this.napi('/subscriptions/' + id, 'DELETE') },
+    // 任务
+    fetchTasks(qs) { return this.napi('/tasks', 'GET', null, qs) },
+    fetchTask(id) { return this.napi('/tasks/' + id) },
+    ackTask(id, payload) { return this.napi(`/tasks/${id}/ack`, 'POST', payload || {}) },
+    pauseTask(id) { return this.napi(`/tasks/${id}/pause`, 'POST') },
+    resumeTask(id) { return this.napi(`/tasks/${id}/resume`, 'POST') },
+    cancelTask(id) { return this.napi(`/tasks/${id}/cancel`, 'POST') },
+    retryTask(id) { return this.napi(`/tasks/${id}/retry`, 'POST') },
+    escalateTask(id) { return this.napi(`/tasks/${id}/escalate`, 'POST') },
+    delTask(id) { return this.napi('/tasks/' + id, 'DELETE') },
+    purgeHistory(days) { return this.napi('/history/purge', 'POST', { days }) },
+    notifySummary() { return this.napi('/summary') }
   }
 })
