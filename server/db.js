@@ -55,7 +55,7 @@ CREATE TABLE IF NOT EXISTS alert_events (
   time TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'open',  -- open/resolved（预警是否解除）
   resolved TEXT,                -- 解除时间
-  resolve_kind TEXT NOT NULL DEFAULT '' -- 解除途径：manual/batch/close（空=历史数据）
+  resolve_kind TEXT NOT NULL DEFAULT '' -- 解除途径：manual/batch/close/notify（空=历史数据）
 );
 CREATE TABLE IF NOT EXISTS crisis (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -100,6 +100,72 @@ CREATE TABLE IF NOT EXISTS crisis_closures (
   rolled_back_at TEXT,
   rollback_note TEXT NOT NULL DEFAULT ''
 );
+-- 通知渠道配置：webhook/邮件/短信/站内信，target 为推送地址（演示用模拟发送）
+CREATE TABLE IF NOT EXISTS notify_channels (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  type TEXT NOT NULL DEFAULT 'webhook', -- webhook/email/sms/inapp
+  target TEXT NOT NULL DEFAULT '',      -- 推送地址/邮箱/号码
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created TEXT NOT NULL,
+  created_by TEXT NOT NULL DEFAULT ''
+);
+-- 订阅编排：按预警规则/话题/危机状态匹配，多渠道并行推送，可要求回执并配置超时升级
+CREATE TABLE IF NOT EXISTS notify_subs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  alert_id INTEGER,                     -- 限定预警规则（NULL=不限）
+  topic TEXT NOT NULL DEFAULT '',       -- 限定话题（空=不限）
+  crisis_status TEXT NOT NULL DEFAULT '', -- 订阅危机状态流转（空=预警订阅；monitoring/disposal/closed）
+  levels TEXT NOT NULL DEFAULT '',      -- 限定预警级别（空=不限；逗号分隔 red,orange,yellow）
+  channel_ids TEXT NOT NULL DEFAULT '[]', -- 通知渠道 id 列表（JSON 数组）
+  require_ack INTEGER NOT NULL DEFAULT 0, -- 是否需要确认回执
+  ack_timeout_min INTEGER NOT NULL DEFAULT 30, -- 回执超时（分钟），超时未确认自动升级
+  escalate_channel_id INTEGER,          -- 升级渠道（空=沿用原渠道）
+  max_retry INTEGER NOT NULL DEFAULT 3, -- 发送失败自动重试上限
+  active INTEGER NOT NULL DEFAULT 1,
+  created TEXT NOT NULL,
+  created_by TEXT NOT NULL DEFAULT ''
+);
+-- 通知任务：由订阅匹配生成（幂等键去重），状态机驱动发送/重试/暂停/回执/升级
+CREATE TABLE IF NOT EXISTS notify_tasks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  idem_key TEXT NOT NULL UNIQUE,        -- 幂等键：同一来源事件×订阅×渠道只生成一次
+  sub_id INTEGER,
+  channel_id INTEGER NOT NULL,
+  alert_event_id INTEGER,               -- 来源预警触发（回执同步解除用）
+  crisis_id INTEGER,                    -- 来源危机事件（回执/升级写时间线）
+  kind TEXT NOT NULL DEFAULT 'alert',   -- alert/crisis
+  title TEXT NOT NULL,
+  content TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'pending', -- pending/sent/failed/acked/escalated/paused/cancelled
+  attempts INTEGER NOT NULL DEFAULT 0,
+  max_attempts INTEGER NOT NULL DEFAULT 3,
+  next_retry_at INTEGER,                -- 下次自动重试毫秒时间戳（NULL=立即）
+  require_ack INTEGER NOT NULL DEFAULT 0,
+  ack_by TEXT NOT NULL DEFAULT '',
+  ack_at TEXT,
+  ack_note TEXT NOT NULL DEFAULT '',
+  escalate_at INTEGER,                  -- 回执超时升级毫秒时间戳
+  escalated INTEGER NOT NULL DEFAULT 0,
+  escalated_from INTEGER,               -- 升级来源任务（升级任务不再二次升级）
+  pause_prev TEXT NOT NULL DEFAULT '',  -- 暂停前状态（恢复语义记录）
+  last_error TEXT NOT NULL DEFAULT '',
+  created TEXT NOT NULL,
+  updated TEXT NOT NULL,
+  sent_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_notify_tasks_due ON notify_tasks (status, next_retry_at);
+-- 通知历史追踪：生成/发送/重试/暂停/恢复/回执/升级/取消全程留痕（含操作人）
+CREATE TABLE IF NOT EXISTS notify_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id INTEGER NOT NULL,
+  action TEXT NOT NULL,                 -- created/sent/retry/failed/paused/resumed/acked/escalated/cancelled
+  detail TEXT NOT NULL DEFAULT '',
+  operator TEXT NOT NULL DEFAULT '系统',
+  time TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_notify_logs_task ON notify_logs (task_id, id);
 -- 可恢复批量导入：任务主表（幂等标识、状态机、进度、结果汇总）
 CREATE TABLE IF NOT EXISTS import_jobs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -350,3 +416,23 @@ function seed() {
     ['事件结案', '舆情热度回落至常态区间，负面占比降至 5% 以下，完成处置闭环。', ago(2840)]].forEach((t) => ct.run(c3, t[0], t[1], t[2]))
 }
 seed()
+
+// 通知渠道与订阅编排种子（独立幂等：老库升级后同样补齐演示配置；任务由调度器在运行时生成）
+function seedNotify() {
+  const n = db.prepare('SELECT COUNT(*) c FROM notify_channels').get().c
+  if (n > 0) return
+  const nowStr = new Date().toLocaleString('zh-CN')
+  const nc = db.prepare('INSERT INTO notify_channels (name,type,target,enabled,created,created_by) VALUES (?,?,?,1,?,?)')
+  const ch1 = Number(nc.run('值班 Webhook', 'webhook', 'https://ops.internal/alert-hook', nowStr, '系统初始化').lastInsertRowid)
+  const ch2 = Number(nc.run('危机邮箱组', 'email', 'mailto:crisis@brand.com', nowStr, '系统初始化').lastInsertRowid)
+  const ch3 = Number(nc.run('短信网关', 'sms', 'sms://flaky-gateway', nowStr, '系统初始化').lastInsertRowid) // flaky：首次发送模拟瞬时故障，演示自动重试
+  const ch4 = Number(nc.run('升级专线', 'webhook', 'https://ops.internal/escalation', nowStr, '系统初始化').lastInsertRowid)
+  const ns = db.prepare('INSERT INTO notify_subs (name,alert_id,topic,crisis_status,levels,channel_ids,require_ack,ack_timeout_min,escalate_channel_id,max_retry,active,created,created_by) VALUES (?,?,?,?,?,?,?,?,?,?,1,?,?)')
+  // 红色预警 → Webhook + 邮箱，需回执，1 分钟超时升级至升级专线
+  ns.run('红色预警全员通知', null, '', '', 'red', JSON.stringify([ch1, ch2]), 1, 1, ch4, 3, nowStr, '系统初始化')
+  // 食安话题 → 邮箱 + 短信（短信通道首次发送模拟故障，演示失败重试）
+  ns.run('食安话题跟踪推送', null, '食品安全', '', '', JSON.stringify([ch2, ch3]), 0, 30, null, 3, nowStr, '系统初始化')
+  // 危机结案 → Webhook 通报
+  ns.run('危机结案通报', null, '', 'closed', '', JSON.stringify([ch1]), 0, 30, null, 3, nowStr, '系统初始化')
+}
+seedNotify()

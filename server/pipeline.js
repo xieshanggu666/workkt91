@@ -1,4 +1,6 @@
 import { db, parseTimeMs } from './db.js'
+// 通知编排钩子（循环引用仅在运行期函数内使用，ESM 活体绑定可安全解析）
+import { generateForAlertEvent, generateForCrisisStatus } from './notify.js'
 
 const q = (sql, ...p) => db.prepare(sql).all(...p)
 const q1 = (sql, ...p) => db.prepare(sql).get(...p)
@@ -137,11 +139,14 @@ export function checkAlerts(postId) {
         crisisId = Number(r.lastInsertRowid)
         attachRule(crisisId, al.id, true, ts)
         addTimeline(crisisId, '自动建档', `高等级预警触发：${detail}`, ts)
+        generateForCrisisStatus(crisisId, 'monitoring') // 通知编排：危机建档（监测中）状态流转
       }
     }
     const ev = run('INSERT INTO alert_events (alert_id,post_id,crisis_id,detail,time,status,resolved) VALUES (?,?,?,?,?,?,?)',
       al.id, postId, crisisId, detail, ts, 'open', null)
-    fired.push({ alert: al.title, level: al.level, eventId: Number(ev.lastInsertRowid), crisisId, deduped, topic })
+    const eventId = Number(ev.lastInsertRowid)
+    const notified = generateForAlertEvent(eventId).length // 通知编排：按订阅生成通知任务
+    fired.push({ alert: al.title, level: al.level, eventId, crisisId, deduped, topic, notified })
   }
   return fired
 }

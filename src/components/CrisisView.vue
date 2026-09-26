@@ -177,7 +177,7 @@ async function reopen(c) {
   await store.reopenCrisis(c.id, note)
   if (reviewId.value === c.id) review.value = await store.fetchCrisisReview(c.id) // 刷新回溯（结案档案/未解除计数）
 }
-function kindText(k) { return { manual: '手动解除', batch: '批量解除', close: '结案联动' }[k] || k }
+function kindText(k) { return { manual: '手动解除', batch: '批量解除', close: '结案联动', notify: '通知回执' }[k] || k }
 async function del(c) {
   if (confirm(`删除危机「${c.title}」？`)) await store.delCrisis(c.id)
 }

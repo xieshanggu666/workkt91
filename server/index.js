@@ -6,6 +6,12 @@ import {
 import {
   JOB_MAX, createJob, getJob, listJobs, resumeJob, pauseJob, recoverInterrupted
 } from './import-engine.js'
+import {
+  actorOf, permit, ROLE_TEXT, CHANNEL_TYPES, TASK_STATUS, CRISIS_STATUS_TEXT,
+  listConfig, validateChannel, validateSub, listTasks, getTask,
+  pauseTask, resumeTask, retryTask, cancelTask, ackTask, listLogs,
+  generateForCrisisStatus, seedNotifyTasks, startScheduler
+} from './notify.js'
 
 const app = express()
 app.use(express.json({ limit: '5mb' })) // 大批量导入（上限 5000 条）
@@ -17,6 +23,10 @@ const run = (sql, ...p) => db.prepare(sql).run(...p)
 // 启动恢复：崩溃/重启时未完成的导入任务转「已暂停」，保留进度，等待续跑
 const recovered = recoverInterrupted()
 if (recovered) console.log(`[PUBMON] 恢复 ${recovered} 个中断的批量导入任务（已暂停，可续跑）`)
+// 通知编排：为存量未解除预警补生成通知任务（幂等），并启动发送/重试/升级调度器
+const seededNotify = seedNotifyTasks()
+if (seededNotify) console.log(`[NOTIFY] 为存量未解除预警生成 ${seededNotify} 个通知任务`)
+startScheduler()
 
 // 危机列表（含来源规则、承接规则、未解除预警数、时间线）
 function crisisList(withTimeline = false) {
@@ -45,7 +55,8 @@ app.get('/api/state', (req, res) => {
     (SELECT COUNT(*) FROM alert_events WHERE status='open') alertOpen,
     (SELECT COUNT(*) FROM alert_events) alertTotal,
     (SELECT COUNT(*) FROM crisis WHERE status!='closed') crisisActive,
-    (SELECT COUNT(*) FROM crisis WHERE status='closed') crisisClosed`)
+    (SELECT COUNT(*) FROM crisis WHERE status='closed') crisisClosed,
+    (SELECT COUNT(*) FROM notify_tasks WHERE status IN ('pending','failed')) notifyOpen`)
   // 热度趋势（近7时段）
   const nowH = new Date().getHours()
   const trend = []
@@ -314,6 +325,7 @@ app.post('/api/crisis', (req, res) => {
     title, level || 'orange', 'monitoring', plan || '', analysis || '', now(), now(), linked_email || '', keyword || '', (topic || '').trim())
   const id = Number(r.lastInsertRowid)
   run('INSERT INTO crisis_timeline (crisis_id,action,note,time) VALUES (?,?,?,?)', id, '事件建档', '人工建档，初始响应', now())
+  generateForCrisisStatus(id, 'monitoring') // 通知编排：人工建档进入监测中
   res.json({ ok: true, id })
 })
 app.post('/api/crisis/:id/status', (req, res) => {
@@ -325,6 +337,7 @@ app.post('/api/crisis/:id/status', (req, res) => {
   if (c.status === 'closed') return res.status(400).json({ error: '已结案事件请先回滚结案再变更状态' })
   run('UPDATE crisis SET status=? WHERE id=?', status || c.status, c.id)
   addTimeline(c.id, action || '状态更新', note || '')
+  if (status && status !== c.status) generateForCrisisStatus(c.id, status) // 通知编排：状态流转
   res.json({ ok: true })
 })
 app.post('/api/crisis/:id/timeline', (req, res) => {
@@ -394,6 +407,7 @@ app.post('/api/crisis/:id/close', (req, res) => {
     try { db.exec('ROLLBACK') } catch { /* 已回滚 */ }
     return res.status(500).json({ error: String(e.message || e) })
   }
+  generateForCrisisStatus(c.id, 'closed') // 通知编排：结案通报
   res.json({ ok: true, resolved: opens.length, closureId })
 })
 
@@ -430,6 +444,7 @@ app.post('/api/crisis/:id/reopen', (req, res) => {
     try { db.exec('ROLLBACK') } catch { /* 已回滚 */ }
     return res.status(500).json({ error: String(e.message || e) })
   }
+  generateForCrisisStatus(c.id, backTo) // 通知编排：结案回滚后的状态流转
   res.json({ ok: true, restored, status: backTo })
 })
 app.delete('/api/crisis/:id', (req, res) => {
@@ -439,6 +454,133 @@ app.delete('/api/crisis/:id', (req, res) => {
   run('DELETE FROM crisis_closures WHERE crisis_id=?', req.params.id)
   run('DELETE FROM crisis WHERE id=?', req.params.id)
   res.json({ ok: true })
+})
+
+// ===== 通知中心：多渠道订阅与通知编排 =====
+// 权限：viewer 只读 / ops 任务操作（暂停·恢复·重试·回执·取消） / admin 渠道与订阅配置
+const NEED_TEXT = { admin: '管理员', ops: '值班员' }
+function guard(need) {
+  return (req, res, next) => {
+    const a = permit(req, need)
+    if (!a) return res.status(403).json({ error: `权限不足：该操作需要${NEED_TEXT[need] || need}权限（当前：${ROLE_TEXT[actorOf(req).role]}）`, need })
+    req.actor = a
+    next()
+  }
+}
+
+// 总览：渠道 + 订阅 + 任务计数 + 当前身份（前端据此渲染权限化界面）
+app.get('/api/notify/overview', (req, res) => {
+  const { channels, subs } = listConfig()
+  const counts = {}
+  for (const r of q('SELECT status, COUNT(*) c FROM notify_tasks GROUP BY status')) counts[r.status] = r.c
+  res.json({
+    channels, subs, counts,
+    actor: actorOf(req), roles: ROLE_TEXT, channelTypes: CHANNEL_TYPES,
+    taskStatus: TASK_STATUS, crisisStatus: CRISIS_STATUS_TEXT
+  })
+})
+
+// 渠道配置（admin）
+app.post('/api/notify/channels', guard('admin'), (req, res) => {
+  const err = validateChannel(req.body)
+  if (err) return res.status(400).json({ error: err })
+  run('INSERT INTO notify_channels (name,type,target,enabled,created,created_by) VALUES (?,?,?,1,?,?)',
+    req.body.name.trim(), req.body.type, req.body.target.trim(), now(), req.actor.user)
+  res.json({ ok: true })
+})
+app.put('/api/notify/channels/:id', guard('admin'), (req, res) => {
+  const ch = q1('SELECT * FROM notify_channels WHERE id=?', req.params.id)
+  if (!ch) return res.status(404).json({ error: '渠道不存在' })
+  const b = req.body || {}
+  const next = {
+    name: typeof b.name === 'string' && b.name.trim() ? b.name.trim() : ch.name,
+    type: CHANNEL_TYPES[b.type] ? b.type : ch.type,
+    target: typeof b.target === 'string' && b.target.trim() ? b.target.trim() : ch.target
+  }
+  run('UPDATE notify_channels SET name=?, type=?, target=? WHERE id=?', next.name, next.type, next.target, ch.id)
+  res.json({ ok: true })
+})
+app.post('/api/notify/channels/:id/toggle', guard('admin'), (req, res) => {
+  const ch = q1('SELECT * FROM notify_channels WHERE id=?', req.params.id)
+  if (!ch) return res.status(404).json({ error: '渠道不存在' })
+  run('UPDATE notify_channels SET enabled=? WHERE id=?', ch.enabled ? 0 : 1, ch.id)
+  res.json({ ok: true, enabled: ch.enabled ? 0 : 1 })
+})
+app.delete('/api/notify/channels/:id', guard('admin'), (req, res) => {
+  run('DELETE FROM notify_channels WHERE id=?', req.params.id)
+  res.json({ ok: true })
+})
+
+// 订阅编排（admin）
+app.post('/api/notify/subs', guard('admin'), (req, res) => {
+  const err = validateSub(req.body)
+  if (err) return res.status(400).json({ error: err })
+  const b = req.body
+  run(`INSERT INTO notify_subs (name,alert_id,topic,crisis_status,levels,channel_ids,require_ack,ack_timeout_min,escalate_channel_id,max_retry,active,created,created_by)
+    VALUES (?,?,?,?,?,?,?,?,?,?,1,?,?)`,
+    b.name.trim(), b.alert_id ? +b.alert_id : null, (b.topic || '').trim(), String(b.crisis_status || ''),
+    (Array.isArray(b.levels) ? b.levels : []).filter((x) => ['red', 'orange', 'yellow'].includes(x)).join(','),
+    JSON.stringify(b.channel_ids.map(Number)), b.require_ack ? 1 : 0,
+    Math.max(1, +b.ack_timeout_min || 30), b.escalate_channel_id ? +b.escalate_channel_id : null,
+    Math.min(5, Math.max(1, +b.max_retry || 3)), now(), req.actor.user)
+  res.json({ ok: true })
+})
+app.put('/api/notify/subs/:id', guard('admin'), (req, res) => {
+  const s = q1('SELECT * FROM notify_subs WHERE id=?', req.params.id)
+  if (!s) return res.status(404).json({ error: '订阅不存在' })
+  const err = validateSub(req.body)
+  if (err) return res.status(400).json({ error: err })
+  const b = req.body
+  run(`UPDATE notify_subs SET name=?,alert_id=?,topic=?,crisis_status=?,levels=?,channel_ids=?,require_ack=?,ack_timeout_min=?,escalate_channel_id=?,max_retry=? WHERE id=?`,
+    b.name.trim(), b.alert_id ? +b.alert_id : null, (b.topic || '').trim(), String(b.crisis_status || ''),
+    (Array.isArray(b.levels) ? b.levels : []).filter((x) => ['red', 'orange', 'yellow'].includes(x)).join(','),
+    JSON.stringify(b.channel_ids.map(Number)), b.require_ack ? 1 : 0,
+    Math.max(1, +b.ack_timeout_min || 30), b.escalate_channel_id ? +b.escalate_channel_id : null,
+    Math.min(5, Math.max(1, +b.max_retry || 3)), s.id)
+  res.json({ ok: true })
+})
+app.post('/api/notify/subs/:id/toggle', guard('admin'), (req, res) => {
+  const s = q1('SELECT * FROM notify_subs WHERE id=?', req.params.id)
+  if (!s) return res.status(404).json({ error: '订阅不存在' })
+  run('UPDATE notify_subs SET active=? WHERE id=?', s.active ? 0 : 1, s.id)
+  res.json({ ok: true, active: s.active ? 0 : 1 })
+})
+app.delete('/api/notify/subs/:id', guard('admin'), (req, res) => {
+  run('DELETE FROM notify_subs WHERE id=?', req.params.id)
+  res.json({ ok: true })
+})
+
+// 任务看板与操作（ops 及以上）
+app.get('/api/notify/tasks', (req, res) => {
+  res.json(listTasks({ status: String(req.query.status || ''), limit: Math.min(200, +req.query.limit || 100) }))
+})
+app.get('/api/notify/tasks/:id', (req, res) => {
+  const task = getTask(+req.params.id)
+  if (!task) return res.status(404).json({ error: '任务不存在' })
+  res.json({ task, logs: listLogs({ taskId: task.id, limit: 50 }) })
+})
+function taskAction(handler) {
+  return (req, res) => {
+    const r = handler(+req.params.id, req.actor, (req.body && req.body.note || '').trim())
+    if (!r) return res.status(404).json({ error: '任务不存在' })
+    if (r.error) return res.status(400).json({ error: r.error })
+    res.json({ ok: true, already: !!r.already, resolved: r.resolved || 0, crisisId: r.crisisId ?? null, task: r.task })
+  }
+}
+app.post('/api/notify/tasks/:id/pause', guard('ops'), taskAction(pauseTask))
+app.post('/api/notify/tasks/:id/resume', guard('ops'), taskAction(resumeTask))
+app.post('/api/notify/tasks/:id/retry', guard('ops'), taskAction(retryTask))
+app.post('/api/notify/tasks/:id/cancel', guard('ops'), taskAction(cancelTask))
+app.post('/api/notify/tasks/:id/ack', guard('ops'), taskAction(ackTask))
+
+// 历史追踪（全部任务或单任务留痕）
+app.get('/api/notify/logs', (req, res) => {
+  res.json({
+    logs: listLogs({
+      taskId: req.query.task_id ? +req.query.task_id : null,
+      limit: Math.min(200, +req.query.limit || 100)
+    })
+  })
 })
 
 const PORT = Number(process.env.PORT) || 4130

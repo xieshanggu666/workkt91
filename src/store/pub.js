@@ -1,8 +1,11 @@
 import { defineStore } from 'pinia'
 
+// 当前操作身份（演示权限模型：请求头携带，服务端强制校验）
+let actor = { name: '张岚', role: 'admin' }
+
 async function api(path, method = 'GET', body, qs, extraHeaders) {
   const url = '/api' + path + (qs ? '?' + new URLSearchParams(qs).toString() : '')
-  const opt = { method, headers: { 'Content-Type': 'application/json', ...(extraHeaders || {}) } }
+  const opt = { method, headers: { 'Content-Type': 'application/json', 'x-user': encodeURIComponent(actor.name), 'x-role': actor.role, ...(extraHeaders || {}) } }
   if (body) opt.body = JSON.stringify(body)
   const r = await fetch(url, opt)
   const data = await r.json()
@@ -14,9 +17,14 @@ export const usePubStore = defineStore('pub', {
   state: () => ({
     loaded: false,
     sources: [], hotWords: [], activeAlerts: [], crises: [], stats: {}, trend: [],
+    user: { name: '张岚', role: 'admin' }, // 当前身份（admin 管理员 / ops 值班员 / viewer 观察员）
     toast: null
   }),
   actions: {
+    setUser(u) {
+      this.user = u
+      actor = u
+    },
     async load() {
       const d = await api('/state')
       this.sources = d.sources; this.hotWords = d.hotWords; this.activeAlerts = d.activeAlerts
@@ -85,6 +93,33 @@ export const usePubStore = defineStore('pub', {
       else this.msg(r.restored ? `已回滚结案，恢复 ${r.restored} 条未解除预警` : '已回滚结案，事件重新打开', 'success')
       return r
     },
-    async delCrisis(id) { await api('/crisis/' + id, 'DELETE'); await this.load() }
+    async delCrisis(id) { await api('/crisis/' + id, 'DELETE'); await this.load() },
+    // ===== 通知中心：多渠道订阅与通知编排 =====
+    async fetchTopics() { return await api('/topics') },
+    async fetchNotifyOverview() { return await api('/notify/overview') },
+    async saveChannel(c) { await api('/notify/channels', 'POST', c); this.msg('通知渠道已保存', 'success') },
+    async toggleChannel(id) { await api(`/notify/channels/${id}/toggle`, 'POST') },
+    async delChannel(id) { await api(`/notify/channels/${id}`, 'DELETE'); this.msg('渠道已删除', 'success') },
+    async saveSub(s) { await api('/notify/subs', 'POST', s); this.msg('订阅已保存', 'success') },
+    async toggleSub(id) { await api(`/notify/subs/${id}/toggle`, 'POST') },
+    async delSub(id) { await api(`/notify/subs/${id}`, 'DELETE'); this.msg('订阅已删除', 'success') },
+    async fetchNotifyTasks(status) { return await api('/notify/tasks', 'GET', null, status ? { status } : null) },
+    async fetchNotifyTask(id) { return await api(`/notify/tasks/${id}`) },
+    // 任务操作（暂停/恢复/重试/取消）：统一入口，错误 toast 由调用方处理
+    async notifyTaskOp(id, op) {
+      const r = await api(`/notify/tasks/${id}/${op}`, 'POST')
+      await this.load() // 刷新全局角标（待处理通知计数）
+      return r
+    },
+    // 确认回执：同步解除关联预警并写危机时间线
+    async ackNotifyTask(id, note) {
+      const r = await api(`/notify/tasks/${id}/ack`, 'POST', { note })
+      await this.load()
+      if (r.already) this.msg('该任务已确认过回执，重复确认已忽略', 'info')
+      else if (r.resolved) this.msg(`回执已确认，同步解除 ${r.resolved} 条预警${r.crisisId ? `，已写入危机 #${r.crisisId} 时间线` : ''}`, 'success')
+      else this.msg(`回执已确认${r.crisisId ? `，已写入危机 #${r.crisisId} 时间线` : ''}`, 'success')
+      return r
+    },
+    async fetchNotifyLogs(taskId) { return (await api('/notify/logs', 'GET', null, taskId ? { task_id: taskId } : null)).logs }
   }
 })
